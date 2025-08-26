@@ -34,6 +34,10 @@ apt install -y libbpf-dev libelf-dev
 echo "Installing kernel headers..."
 apt install -y linux-headers-$(uname -r)
 
+# Install architecture-specific headers
+echo "Installing architecture-specific headers..."
+apt install -y linux-libc-dev
+
 # Install bpftool
 echo "Installing bpftool..."
 apt install -y bpftool
