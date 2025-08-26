@@ -41,7 +41,6 @@ $(BPF_OBJ): $(BPF_SRC)
 		-I/usr/include \
 		-I$(KERNEL_ROOT)/arch/x86/include \
 		-D__KERNEL__ \
-		-include asm_types_workaround.h \
 		-o $@ $<
 
 # Compile userspace program (optional)
