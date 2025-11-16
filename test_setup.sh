@@ -92,16 +92,30 @@ else
     echo "  Mount with: sudo mount -t bpf bpf /sys/fs/bpf"
 fi
 
-if [[ -f "/sys/kernel/debug/bpf/verifier_log" ]]; then
-    echo "✓ BPF verifier available"
+if command -v bpftool >/dev/null 2>&1; then
+    echo "✓ bpftool available"
+    bpftool version 2>/dev/null | head -1 || true
 else
-    echo "✗ BPF verifier not available"
+    echo "✗ bpftool not found"
+    echo "  Install with: sudo apt install bpftool"
 fi
 
-if [[ -f "/sys/kernel/debug/bpf/stack_map" ]]; then
-    echo "✓ BPF stack trace support available"
+if mount | grep -q "debugfs on /sys/kernel/debug"; then
+    echo "✓ debugfs mounted"
+    if sudo test -f "/sys/kernel/debug/bpf/verifier_log" 2>/dev/null; then
+        echo "✓ BPF verifier log available (BPF programs have been loaded)"
+    else
+        echo "ℹ BPF verifier log will be available after loading a BPF program"
+    fi
+    
+    if sudo test -f "/sys/kernel/debug/bpf/stack_map" 2>/dev/null; then
+        echo "✓ BPF stack trace support available"
+    else
+        echo "ℹ BPF stack trace support will be available after loading BPF programs"
+    fi
 else
-    echo "✗ BPF stack trace support not available"
+    echo "ℹ debugfs not mounted (optional, for debugging)"
+    echo "  Mount with: sudo mount -t debugfs debugfs /sys/kernel/debug"
 fi
 
 echo

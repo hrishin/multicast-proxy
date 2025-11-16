@@ -4,7 +4,7 @@ This BPF program implements multicast packet handling using XDP (eXpress Data Pa
 
 ## Features
 
-- **Downstream XDP**: Captures IGMP join/leave messages from veth interfaces
+- **Downstream capture (XDP on veth)**: Captures IGMP join/leave messages from downstream interfaces
 - **Upstream XDP**: Broadcasts multicast data to subscribed interfaces
 - **Ring Buffer**: Efficient event notification to userspace
 - **DevMap**: Fast packet redirection to multiple interfaces
@@ -87,11 +87,11 @@ make unload
 ### BPF Maps
 
 - **`events`**: Ring buffer for IGMP join/leave events
-- **`fwd_map`**: DevMap for packet redirection to veth interfaces
+- **`fwd_map`**: DevMap for packet redirection to downstream interfaces (veth endpoints)
 
-### XDP Programs
+### Programs
 
-1. **`xdp_downstream`**: Attach to veth interfaces
+1. **`xdp_downstream`**: Attach to veth/downstream interfaces
    - Captures IGMP join/leave messages
    - Reports events to userspace via ring buffer
    - Drops IGMP packets after processing
@@ -101,15 +101,16 @@ make unload
    - Redirects to subscribed interfaces via devmap
    - Passes through IGMP control packets
 
+3. Netkit-specific programs have been removed in favor of a simpler veth/XDP flow.
+
 ## Attaching to Interfaces
 
 ### Attach Downstream Program
 
 ```bash
-# Attach to veth interface
-sudo bpftool net attach xdp id <prog_id> dev <veth_name>
+# For veth/XDP:
+sudo bpftool net attach xdp id <prog_id> dev <downstream_ifname>
 ```
-
 ### Attach Upstream Program
 
 ```bash
@@ -125,6 +126,7 @@ sudo bpftool net attach xdp id <prog_id> dev eth0
 2. **BPF verifier errors**: Check kernel version compatibility
 3. **Permission denied**: Run with sudo/root privileges
 4. **Interface not found**: Verify interface names exist
+5. **BPF verifier log not available**: The verifier log at `/sys/kernel/debug/bpf/verifier_log` is created dynamically when BPF programs are loaded. This is normal if you haven't loaded any BPF programs yet.
 
 ### Debug Commands
 

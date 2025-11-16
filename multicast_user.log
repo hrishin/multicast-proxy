@@ -1,0 +1,12 @@
+Attached xdp_downstream to veth-host (ifindex: 119)
+Warning: native XDP attach failed on ens5: create link: invalid argument
+Attached xdp_upstream to ens5 in generic mode
+Monitoring IGMP events... Press Ctrl+C to exit
+XDP attached to interface: veth-host (ifindex: 119)
+[EVENT] type=JOIN (1), group=239.1.2.3 (0xef010203), ifindex=119
+[FWD_MAP] Added ifindex 119 to forwarding map (key: 0, group: 239.1.2.3)
+[FWD_MAP] Verified: map entry 0 -> ifindex 119
+[EVENT] type=JOIN (1), group=239.1.2.3 (0xef010203), ifindex=119
+[FWD_MAP] ifindex 119 already in forwarding map (key: 0)
+[EVENT] type=JOIN (1), group=239.1.2.3 (0xef010203), ifindex=119
+[FWD_MAP] ifindex 119 already in forwarding map (key: 0)

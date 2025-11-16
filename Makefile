@@ -5,18 +5,23 @@
 CLANG ?= clang
 LLC ?= llc
 CC ?= gcc
+# Prefer system go; if not found, use /usr/local/go/bin/go (installed from tarball)
+GO ?= $(shell command -v go 2>/dev/null || echo /usr/local/go/bin/go)
 
 # Kernel headers path - adjust for your Ubuntu version
 KERNEL_HEADERS ?= /usr/include
 BPF_HEADERS ?= /usr/include
 
+# Detect kernel headers path dynamically
+KERNEL_VERSION := $(shell uname -r)
+KERNEL_ROOT := /usr/src/linux-headers-$(KERNEL_VERSION)
+
 # Set architecture-specific header paths
 # For Ubuntu, use the actual kernel headers path
 # We need to include the parent of the arch directory so asm symlinks work
-ARCH_HEADERS := /usr/src/linux-aws-6.14-headers-6.14.0-1011/arch/x86/include
-ARCH_PARENT := /usr/src/linux-aws-6.14-headers-6.14.0-1011/arch/x86
-KERNEL_ARCH := /usr/src/linux-aws-6.14-headers-6.14.0-1011
-KERNEL_ROOT := /usr/src/linux-aws-6.14-headers-6.14.0-1011
+ARCH_HEADERS := $(KERNEL_ROOT)/arch/x86/include
+ARCH_PARENT := $(KERNEL_ROOT)/arch/x86
+KERNEL_ARCH := $(KERNEL_ROOT)
 
 # Compiler flags
 CFLAGS = -g -O2 -Wall -Wextra
@@ -26,29 +31,35 @@ BPF_CFLAGS = -g -O2 -target bpf -c
 BPF_SRC = multicast.bpf.c
 BPF_OBJ = multicast.bpf.o
 
-# Userspace program (if you want to create one)
-USER_SRC = multicast_user.c
+# Userspace program (C or Go)
+GO_SRC := $(wildcard multicast_user.go)
 USER_OBJ = multicast_user
 USER_DEPS = -lbpf -lelf
 
 # Default target
-all: $(BPF_OBJ)
+all: $(BPF_OBJ) $(USER_OBJ)
 
 # Compile BPF program
 $(BPF_OBJ): $(BPF_SRC)
 	$(CLANG) $(BPF_CFLAGS) \
 		-I. \
 		-I/usr/include \
-		-I$(KERNEL_ROOT)/arch/x86/include \
+		-I/usr/include/x86_64-linux-gnu \
 		-D__KERNEL__ \
+		-D__BPF__ \
 		-o $@ $<
 
-# Compile userspace program (optional)
-$(USER_OBJ): $(USER_SRC)
+# Compile userspace program: prefer Go if multicast_user.go exists, else build C
+ifeq ($(GO_SRC),)
+$(USER_OBJ): multicast_user.c
 	$(CC) $(CFLAGS) \
 		-I$(KERNEL_HEADERS) \
 		-I$(BPF_HEADERS) \
 		-o $@ $< $(USER_DEPS)
+else
+$(USER_OBJ): multicast_user.go go.mod
+	GO111MODULE=on $(GO) build -o $@ multicast_user.go
+endif
 
 # Clean
 clean:
@@ -57,13 +68,19 @@ clean:
 # Fix asm symlink for compilation
 fix-asm:
 	@echo "Fixing asm symlink..."
-	@if [ ! -L "$(KERNEL_ROOT)/include/asm" ]; then \
-		echo "Creating asm symlink..."; \
-		ln -sf $(KERNEL_ROOT)/arch/x86/include/asm $(KERNEL_ROOT)/include/asm; \
+	@if [ ! -d "$(KERNEL_ROOT)" ]; then \
+		echo "Error: Kernel headers not found at $(KERNEL_ROOT)"; \
+		echo "Install with: sudo apt install linux-headers-$(KERNEL_VERSION)"; \
+		exit 1; \
 	fi
-	@if [ ! -L "$(KERNEL_ROOT)/include/uapi/asm" ]; then \
+	@if [ ! -L "$(KERNEL_ROOT)/include/asm" ] && [ ! -d "$(KERNEL_ROOT)/include/asm" ]; then \
+		echo "Creating asm symlink..."; \
+		sudo ln -sf $(KERNEL_ROOT)/arch/x86/include/asm $(KERNEL_ROOT)/include/asm; \
+	fi
+	@if [ ! -L "$(KERNEL_ROOT)/include/uapi/asm" ] && [ ! -d "$(KERNEL_ROOT)/include/uapi/asm" ]; then \
 		echo "Creating uapi asm symlink..."; \
-		ln -sf $(KERNEL_ROOT)/arch/x86/include/asm $(KERNEL_ROOT)/include/uapi/asm; \
+		sudo ln -sf $(KERNEL_ROOT)/arch/x86/include/uapi/asm $(KERNEL_ROOT)/include/uapi/asm || \
+		sudo ln -sf $(KERNEL_ROOT)/arch/x86/include/generated/uapi/asm $(KERNEL_ROOT)/include/uapi/asm; \
 	fi
 	@echo "✓ asm symlinks ready"
 
@@ -87,10 +104,20 @@ check-bpf:
 	else \
 		echo "✗ BPF filesystem not mounted. Run: sudo mount -t bpf bpf /sys/fs/bpf"; \
 	fi
-	@if [ -f "/sys/kernel/debug/bpf/verifier_log" ]; then \
-		echo "✓ BPF verifier available"; \
+	@if command -v bpftool >/dev/null 2>&1; then \
+		echo "✓ bpftool available"; \
 	else \
-		echo "✗ BPF verifier not available"; \
+		echo "✗ bpftool not found. Install with: sudo apt install bpftool"; \
+	fi
+	@if mount | grep -q "debugfs on /sys/kernel/debug"; then \
+		echo "✓ debugfs mounted"; \
+		if sudo test -f "/sys/kernel/debug/bpf/verifier_log" 2>/dev/null; then \
+			echo "✓ BPF verifier log available (BPF programs have been loaded)"; \
+		else \
+			echo "ℹ BPF verifier log will be available after loading a BPF program"; \
+		fi; \
+	else \
+		echo "ℹ debugfs not mounted (optional, for debugging)"; \
 	fi
 
 # Check header files
