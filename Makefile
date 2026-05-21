@@ -1,126 +1,133 @@
-# Makefile for BPF multicast program
-# Tested on Ubuntu 20.04+ with kernel 5.4+
+# Makefile — IGMP proxy eBPF/XDP + userspace daemon
+#
+# Build order:
+#   1. Compile BPF program → multicast.bpf.o
+#   2. Generate libbpf skeleton → multicast.bpf.skel.h
+#   3. Compile userspace daemon (multicast_user.c + afxdp.c) → multicast_user
+#
+# Requirements:
+#   clang ≥ 11, libbpf-dev ≥ 0.7, bpftool, linux-headers ≥ 5.10
+#   For Tier-3 AF-XDP: libxdp-dev (or libbpf ≥ 0.7 which bundles xsk.h)
+#   Kernel: 5.10+ for bpf_redirect_peer; 6.7+ for netkit; 5.0 minimum
 
-# Compiler and flags
-CLANG ?= clang
-LLC ?= llc
-CC ?= gcc
+CLANG   ?= clang
+CC      ?= gcc
+BPFTOOL ?= bpftool
 
-# Kernel headers path - adjust for your Ubuntu version
-KERNEL_HEADERS ?= /usr/include
-BPF_HEADERS ?= /usr/include
+# ── Kernel header paths ────────────────────────────────────────────────────
+# Adjust KERNEL_ROOT for your kernel version.
+KERNEL_ROOT     ?= /usr/src/linux-aws-6.14-headers-6.14.0-1011
+KERNEL_HEADERS  ?= /usr/include
+BPF_HEADERS     ?= /usr/include
 
-# Set architecture-specific header paths
-# For Ubuntu, use the actual kernel headers path
-# We need to include the parent of the arch directory so asm symlinks work
-ARCH_HEADERS := /usr/src/linux-aws-6.14-headers-6.14.0-1011/arch/x86/include
-ARCH_PARENT := /usr/src/linux-aws-6.14-headers-6.14.0-1011/arch/x86
-KERNEL_ARCH := /usr/src/linux-aws-6.14-headers-6.14.0-1011
-KERNEL_ROOT := /usr/src/linux-aws-6.14-headers-6.14.0-1011
+# ── Flags ──────────────────────────────────────────────────────────────────
+CFLAGS      = -g -O2 -Wall -Wextra -Wno-unused-parameter
 
-# Compiler flags
-CFLAGS = -g -O2 -Wall -Wextra
-BPF_CFLAGS = -g -O2 -target bpf -c
+BPF_CFLAGS  = -g -O2 -target bpf -c \
+              -I. \
+              -I$(KERNEL_ROOT)/include \
+              -I$(KERNEL_ROOT)/arch/x86/include \
+              -I$(KERNEL_ROOT)/arch/x86 \
+              -D__KERNEL__
 
-# Source files
-BPF_SRC = multicast.bpf.c
-BPF_OBJ = multicast.bpf.o
+# Userspace: include libbpf + local headers; link libbpf, libelf, pthreads
+USER_CFLAGS = $(CFLAGS) \
+              -I. \
+              -I$(KERNEL_HEADERS) \
+              -I$(BPF_HEADERS)
 
-# Userspace program (if you want to create one)
-USER_SRC = multicast_user.c
-USER_OBJ = multicast_user
-USER_DEPS = -lbpf -lelf
+USER_LDFLAGS = -lbpf -lelf -lpthread -lz
 
-# Default target
-all: $(BPF_OBJ)
+# ── Source / target names ──────────────────────────────────────────────────
+BPF_SRC      = multicast.bpf.c
+BPF_OBJ      = multicast.bpf.o
+SKELETON     = multicast.bpf.skel.h
 
-# Compile BPF program
-$(BPF_OBJ): $(BPF_SRC)
-	$(CLANG) $(BPF_CFLAGS) \
-		-I. \
-		-I/usr/include \
-		-I$(KERNEL_ROOT)/arch/x86/include \
-		-D__KERNEL__ \
-		-o $@ $<
+USER_SRCS    = multicast_user.c afxdp.c
+USER_BIN     = multicast_user
 
-# Compile userspace program (optional)
-$(USER_OBJ): $(USER_SRC)
-	$(CC) $(CFLAGS) \
-		-I$(KERNEL_HEADERS) \
-		-I$(BPF_HEADERS) \
-		-o $@ $< $(USER_DEPS)
+# ── Default target ─────────────────────────────────────────────────────────
+.PHONY: all
+all: $(USER_BIN)
 
-# Clean
-clean:
-	rm -f $(BPF_OBJ) $(USER_OBJ)
+# ── Step 1: compile BPF program ───────────────────────────────────────────
+$(BPF_OBJ): $(BPF_SRC) multicast.h asm_types_workaround.h fix-asm
+	$(CLANG) $(BPF_CFLAGS) -o $@ $<
+	@echo "✓ BPF object: $@"
 
-# Fix asm symlink for compilation
+# ── Step 2: generate libbpf skeleton ──────────────────────────────────────
+# The skeleton gives the userspace daemon type-safe map/program accessors
+# without manual bpf_object__find_map_by_name() calls.
+$(SKELETON): $(BPF_OBJ)
+	$(BPFTOOL) gen skeleton $< > $@
+	@echo "✓ Skeleton: $@"
+
+# ── Step 3: compile userspace daemon ──────────────────────────────────────
+$(USER_BIN): $(USER_SRCS) $(SKELETON) multicast.h afxdp.h
+	$(CC) $(USER_CFLAGS) -o $@ $(USER_SRCS) $(USER_LDFLAGS)
+	@echo "✓ Daemon: $@"
+
+# ── Fix asm symlink (Ubuntu kernel header workaround) ─────────────────────
+.PHONY: fix-asm
 fix-asm:
-	@echo "Fixing asm symlink..."
 	@if [ ! -L "$(KERNEL_ROOT)/include/asm" ]; then \
 		echo "Creating asm symlink..."; \
-		ln -sf $(KERNEL_ROOT)/arch/x86/include/asm $(KERNEL_ROOT)/include/asm; \
+		ln -sf $(KERNEL_ROOT)/arch/x86/include/asm \
+		       $(KERNEL_ROOT)/include/asm; \
 	fi
 	@if [ ! -L "$(KERNEL_ROOT)/include/uapi/asm" ]; then \
-		echo "Creating uapi asm symlink..."; \
-		ln -sf $(KERNEL_ROOT)/arch/x86/include/asm $(KERNEL_ROOT)/include/uapi/asm; \
+		ln -sf $(KERNEL_ROOT)/arch/x86/include/uapi/asm \
+		       $(KERNEL_ROOT)/include/uapi/asm 2>/dev/null || true; \
 	fi
-	@echo "✓ asm symlinks ready"
 
-# Install dependencies (Ubuntu)
+# ── Clean ──────────────────────────────────────────────────────────────────
+.PHONY: clean
+clean:
+	rm -f $(BPF_OBJ) $(SKELETON) $(USER_BIN)
+
+# ── Install dependencies (Ubuntu 22.04+) ─────────────────────────────────
+.PHONY: install-deps
 install-deps:
 	sudo apt update
 	sudo apt install -y \
-		clang \
-		llvm \
+		clang llvm \
 		libbpf-dev \
 		linux-headers-$(shell uname -r) \
 		linux-libc-dev \
 		build-essential \
-		libelf-dev
+		libelf-dev \
+		libz-dev \
+		bpftool
 
-# Check if BPF is supported
-check-bpf:
-	@echo "Checking BPF support..."
-	@if [ -d "/sys/fs/bpf" ]; then \
-		echo "✓ BPF filesystem mounted"; \
-	else \
-		echo "✗ BPF filesystem not mounted. Run: sudo mount -t bpf bpf /sys/fs/bpf"; \
-	fi
-	@if [ -f "/sys/kernel/debug/bpf/verifier_log" ]; then \
-		echo "✓ BPF verifier available"; \
-	else \
-		echo "✗ BPF verifier not available"; \
-	fi
+# ── Load / unload helpers ─────────────────────────────────────────────────
+.PHONY: load
+load: $(USER_BIN)
+	sudo UPLINK_IFACE=eth0 ./$(USER_BIN)
 
-# Check header files
-check-headers:
-	@echo "Checking header files..."
-	@echo "KERNEL_HEADERS: $(KERNEL_HEADERS)"
-	@echo "ARCH_HEADERS: $(ARCH_HEADERS)"
-	@if [ -f "$(KERNEL_HEADERS)/linux/bpf.h" ]; then \
-		echo "✓ linux/bpf.h found"; \
-	else \
-		echo "✗ linux/bpf.h not found"; \
-	fi
-	@if [ -f "$(ARCH_HEADERS)/asm/types.h" ]; then \
-		echo "✓ asm/types.h found"; \
-	else \
-		echo "✗ asm/types.h not found in $(ARCH_HEADERS)"; \
-		echo "  Try: make install-deps"; \
-	fi
-
-# Load BPF program (requires root)
-load: $(BPF_OBJ)
-	sudo bpftool prog load $(BPF_OBJ) /sys/fs/bpf/multicast
-
-# Unload BPF program
+.PHONY: unload
 unload:
-	sudo bpftool prog unload /sys/fs/bpf/multicast
+	sudo bpftool net detach xdp dev eth0 2>/dev/null || true
+	sudo rm -f /sys/fs/bpf/igmp-proxy/events \
+	           /sys/fs/bpf/igmp-proxy/group_map \
+	           /sys/fs/bpf/igmp-proxy 2>/dev/null || true
 
-# Show loaded programs
+# ── Verification helpers ───────────────────────────────────────────────────
+.PHONY: show
 show:
 	sudo bpftool prog list
 	sudo bpftool map list
 
-.PHONY: all clean fix-asm install-deps check-bpf check-headers load unload show
+.PHONY: check-bpf
+check-bpf:
+	@echo "Checking BPF support..."
+	@[ -d /sys/fs/bpf ] && echo "✓ BPF fs mounted" || echo "✗ BPF fs not mounted"
+	@grep -q CONFIG_BPF_JIT=y /boot/config-$(shell uname -r) 2>/dev/null \
+		&& echo "✓ BPF JIT enabled in kernel" || echo "  BPF JIT status unknown"
+	@$(BPFTOOL) version 2>/dev/null | head -1 || echo "✗ bpftool not found"
+
+.PHONY: check-headers
+check-headers:
+	@echo "Checking headers..."
+	@[ -f "$(KERNEL_HEADERS)/linux/bpf.h" ]  && echo "✓ linux/bpf.h"  || echo "✗ linux/bpf.h"
+	@[ -f "$(BPF_HEADERS)/bpf/bpf_helpers.h" ] && echo "✓ bpf/bpf_helpers.h" || echo "✗ bpf/bpf_helpers.h"
+	@[ -f "$(BPF_HEADERS)/bpf/xsk.h" ]        && echo "✓ bpf/xsk.h (AF-XDP)" || echo "✗ bpf/xsk.h (install libbpf-dev)"

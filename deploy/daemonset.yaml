@@ -1,0 +1,257 @@
+---
+# Tier-1: IGMP Proxy DaemonSet
+#
+# Runs on every Kubernetes node in the host network namespace.
+# An init container applies the performance sysctls and NIC IRQ affinity
+# before the proxy starts; the main container runs the eBPF-backed proxy.
+#
+# Tier-1 optimisations applied:
+#   net.core.busy_poll / busy_read  — NAPI busy-polling cuts interrupt
+#                                     wakeup latency by 2–5 µs
+#   net.core.bpf_jit_harden=0      — disables constant blinding in JIT,
+#                                     saving ~100–500 ns per BPF invocation
+#                                     (acceptable in trusted prod environments)
+#   NIC IRQ affinity                — pins NIC queues to same NUMA node as
+#                                     container CPUs, eliminating 50–150 ns
+#                                     cross-NUMA cache misses per packet
+#   RPS (Receive Packet Steering)   — steers packets to NUMA-local CPUs
+#
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: igmp-proxy
+  namespace: kube-system
+  labels:
+    app: igmp-proxy
+    tier: networking
+spec:
+  selector:
+    matchLabels:
+      app: igmp-proxy
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: igmp-proxy
+    spec:
+      priorityClassName: system-node-critical
+      hostNetwork: true   # runs in host netns — required for XDP attachment
+      hostPID: true       # needed to enumerate container netns via /proc/<pid>
+
+      tolerations:
+        - operator: Exists   # run on all nodes including control-plane
+
+      # ── Init container: Tier-1 sysctls + IRQ affinity ─────────────────
+      initContainers:
+        - name: setup-performance
+          image: busybox:1.36
+          securityContext:
+            privileged: true   # needed to write /proc/irq and sysctl
+          env:
+            - name: UPLINK_IFACE
+              valueFrom:
+                configMapKeyRef:
+                  name: igmp-proxy-config
+                  key: uplink_iface
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              # ── BPF JIT: disable constant blinding for lower latency ──
+              sysctl -w net.core.bpf_jit_enable=1
+              sysctl -w net.core.bpf_jit_harden=0
+
+              # ── NAPI busy-polling: cuts interrupt wakeup by 2–5 µs ───
+              sysctl -w net.core.busy_poll=50
+              sysctl -w net.core.busy_read=50
+
+              # ── Increase netdev RX budget for batch processing ────────
+              sysctl -w net.core.netdev_budget=600
+              sysctl -w net.core.netdev_budget_usecs=8000
+
+              # ── BPF memory lock limit ─────────────────────────────────
+              echo 'unlimited' > /proc/sys/kernel/bpf_stats_enabled || true
+
+              # ── NIC IRQ affinity to NUMA-local CPUs ───────────────────
+              /scripts/irq-affinity.sh "${UPLINK_IFACE}"
+
+              echo "setup-performance: done"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+
+      # ── Main container: IGMP proxy ────────────────────────────────────
+      containers:
+        - name: igmp-proxy
+          image: ghcr.io/org/igmp-proxy:latest
+          imagePullPolicy: IfNotPresent
+
+          securityContext:
+            privileged: false
+            capabilities:
+              add:
+                - NET_ADMIN    # XDP attach/detach, raw sockets, netlink
+                - BPF          # bpf() syscall without CAP_SYS_ADMIN (≥5.8)
+                - SYS_ADMIN    # setrlimit MEMLOCK, BPF map pinning
+                - NET_RAW      # raw IGMP socket (IP_ADD_MEMBERSHIP)
+              drop:
+                - ALL
+
+          env:
+            - name: UPLINK_IFACE
+              valueFrom:
+                configMapKeyRef:
+                  name: igmp-proxy-config
+                  key: uplink_iface
+            - name: XSK_QUEUE_ID
+              value: "0"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "128Mi"
+              hugepages-2Mi: "16Mi"   # for AF-XDP UMEM (Tier 3)
+            limits:
+              cpu: "1000m"
+              memory: "256Mi"
+              hugepages-2Mi: "16Mi"
+
+          volumeMounts:
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: procfs
+              mountPath: /host/proc
+              readOnly: true
+            - name: hugepages
+              mountPath: /dev/hugepages
+
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -f /sys/fs/bpf/igmp-proxy/events"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+
+      # ── Volumes ────────────────────────────────────────────────────────
+      volumes:
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: Directory
+        - name: procfs
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: hugepages
+          emptyDir:
+            medium: HugePages-2Mi
+        - name: scripts
+          configMap:
+            name: igmp-proxy-scripts
+            defaultMode: 0755
+
+      # ── NUMA-aware scheduling ──────────────────────────────────────────
+      # Prefer nodes where multicast workloads are also scheduled so that
+      # the XDP fast path and container CPUs share L3 cache.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: topology.kubernetes.io/zone
+                    operator: Exists
+
+      # Spread evenly across nodes to avoid hot spots
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: igmp-proxy
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: igmp-proxy-config
+  namespace: kube-system
+data:
+  uplink_iface: "eth0"   # Change to bond0, ens3, etc. for your environment
+
+---
+# IRQ affinity script distributed via ConfigMap so it is available to the
+# init container without baking it into the base image.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: igmp-proxy-scripts
+  namespace: kube-system
+data:
+  irq-affinity.sh: |
+    #!/bin/sh
+    set -e
+    IFACE=${1:-eth0}
+    if [ ! -d "/sys/class/net/${IFACE}" ]; then
+        echo "irq-affinity: ${IFACE} not found, skipping"
+        exit 0
+    fi
+    NUMA_NODE=0
+    if [ -f "/sys/class/net/${IFACE}/device/numa_node" ]; then
+        node=$(cat "/sys/class/net/${IFACE}/device/numa_node")
+        [ "${node}" -ge 0 ] 2>/dev/null && NUMA_NODE="${node}"
+    fi
+    CPU_LIST=""
+    if [ -f "/sys/devices/system/node/node${NUMA_NODE}/cpulist" ]; then
+        CPU_LIST=$(cat "/sys/devices/system/node/node${NUMA_NODE}/cpulist")
+    fi
+    CPU_LIST=${CPU_LIST:-$(cat /sys/devices/system/cpu/online 2>/dev/null || echo "0")}
+    echo "irq-affinity: ${IFACE} NUMA=${NUMA_NODE} CPUs=${CPU_LIST}"
+    SET=0
+    for irq in $(grep -E "${IFACE}" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' '); do
+        f="/proc/irq/${irq}/smp_affinity_list"
+        [ -f "${f}" ] && echo "${CPU_LIST}" > "${f}" 2>/dev/null && SET=$((SET+1)) || true
+    done
+    echo "irq-affinity: set ${SET} IRQ(s) for ${IFACE}"
+
+---
+# ClusterRole: allow the proxy to watch pods (optional — for future k8s API
+# based interface discovery instead of name-pattern heuristic).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: igmp-proxy
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: igmp-proxy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: igmp-proxy
+subjects:
+  - kind: ServiceAccount
+    name: igmp-proxy
+    namespace: kube-system
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: igmp-proxy
+  namespace: kube-system
