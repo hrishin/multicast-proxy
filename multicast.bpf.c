@@ -315,16 +315,16 @@ int xdp_upstream(struct xdp_md *ctx)
         /* Tier 3: zero-copy to daemon UMEM; slot 0 is the aggregator XSK */
         return bpf_redirect_map(&xsk_map, 0, XDP_PASS);
 
-    /* Step 4: single-subscriber fast path — bpf_redirect_peer (~45 ns lookup) */
+    /* Step 4: single-subscriber fast path — bpf_redirect (~45 ns lookup) */
     if (count == 1) {
         __u32 *ifidx = bpf_map_lookup_elem(&group_single_if, &gid);
         if (ifidx && *ifidx)
             /*
-             * Redirects to the peer of *ifidx (container netns ingress),
-             * skipping the TX queue of the host-side netkit/veth peer.
-             * Requires kernel ≥ 5.10.
+             * Redirect via TX queue of the host-side netkit/veth peer;
+             * the kernel delivers the frame to the container RX path.
+             * bpf_redirect_peer is TC-only and not available in XDP.
              */
-            return bpf_redirect_peer(*ifidx, 0);
+            return bpf_redirect(*ifidx, 0);
     }
 
     /* Step 5: multi-subscriber broadcast via ARRAY_OF_MAPS devmap (~45 ns) */

@@ -23,7 +23,7 @@
 
 #include <stdint.h>
 #include <pthread.h>
-#include <bpf/xsk.h>
+#include <xdp/xsk.h>
 
 #define UMEM_NUM_FRAMES     4096
 #define UMEM_FRAME_SIZE     XSK_UMEM__DEFAULT_FRAME_SIZE   /* 4096 bytes */

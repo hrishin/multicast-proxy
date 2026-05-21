@@ -45,7 +45,7 @@
  * Defined here with guards so the daemon compiles on older kernel headers
  * that predate netkit while still detecting it correctly at runtime.
  */
-#ifndef IFLA_NETKIT_UNSPEC
+#ifndef IFLA_NETKIT_MAX
 enum {
     IFLA_NETKIT_UNSPEC,
     IFLA_NETKIT_PEER_INFO,
@@ -55,6 +55,7 @@ enum {
     IFLA_NETKIT_MODE,           /* u32: 0=NETKIT_L2, 1=NETKIT_L3 */
     __IFLA_NETKIT_MAX,
 };
+#define IFLA_NETKIT_MAX (__IFLA_NETKIT_MAX - 1)
 #define NETKIT_L2  0
 #define NETKIT_L3  1
 #endif
@@ -237,6 +238,12 @@ static void afxdp_deactivate_group(struct group_state *gs)
 
 static int group_add_subscriber(struct group_state *gs, uint32_t ifindex)
 {
+    /* Deduplicate: kernel sends multiple IGMP reports per join (retransmits) */
+    for (uint32_t s = 0; s < MAX_SUBS; s++) {
+        if (gs->slot_used[s] && gs->slot_ifindex[s] == ifindex)
+            return 0;
+    }
+
     /* Find a free devmap slot */
     uint32_t slot = MAX_SUBS;
     for (uint32_t s = 0; s < MAX_SUBS; s++) {

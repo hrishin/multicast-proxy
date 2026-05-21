@@ -16,19 +16,19 @@ BPFTOOL ?= bpftool
 
 # ── Kernel header paths ────────────────────────────────────────────────────
 # Adjust KERNEL_ROOT for your kernel version.
-KERNEL_ROOT     ?= /usr/src/linux-aws-6.14-headers-6.14.0-1011
+KERNEL_ROOT     ?= /usr/src/linux-headers-$(shell uname -r)
 KERNEL_HEADERS  ?= /usr/include
 BPF_HEADERS     ?= /usr/include
 
 # ── Flags ──────────────────────────────────────────────────────────────────
 CFLAGS      = -g -O2 -Wall -Wextra -Wno-unused-parameter
 
+ARCH            := $(shell uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/')
+
 BPF_CFLAGS  = -g -O2 -target bpf -c \
               -I. \
-              -I$(KERNEL_ROOT)/include \
-              -I$(KERNEL_ROOT)/arch/x86/include \
-              -I$(KERNEL_ROOT)/arch/x86 \
-              -D__KERNEL__
+              -I$(KERNEL_HEADERS) \
+              -I$(BPF_HEADERS)
 
 # Userspace: include libbpf + local headers; link libbpf, libelf, pthreads
 USER_CFLAGS = $(CFLAGS) \
@@ -36,7 +36,7 @@ USER_CFLAGS = $(CFLAGS) \
               -I$(KERNEL_HEADERS) \
               -I$(BPF_HEADERS)
 
-USER_LDFLAGS = -lbpf -lelf -lpthread -lz
+USER_LDFLAGS = -lbpf -lxdp -lelf -lpthread -lz
 
 # ── Source / target names ──────────────────────────────────────────────────
 BPF_SRC      = multicast.bpf.c
@@ -72,11 +72,11 @@ $(USER_BIN): $(USER_SRCS) $(SKELETON) multicast.h afxdp.h
 fix-asm:
 	@if [ ! -L "$(KERNEL_ROOT)/include/asm" ]; then \
 		echo "Creating asm symlink..."; \
-		ln -sf $(KERNEL_ROOT)/arch/x86/include/asm \
+		ln -sf $(KERNEL_ROOT)/arch/$(ARCH)/include/asm \
 		       $(KERNEL_ROOT)/include/asm; \
 	fi
 	@if [ ! -L "$(KERNEL_ROOT)/include/uapi/asm" ]; then \
-		ln -sf $(KERNEL_ROOT)/arch/x86/include/uapi/asm \
+		ln -sf $(KERNEL_ROOT)/arch/$(ARCH)/include/uapi/asm \
 		       $(KERNEL_ROOT)/include/uapi/asm 2>/dev/null || true; \
 	fi
 

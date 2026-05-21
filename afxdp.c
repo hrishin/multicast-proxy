@@ -14,6 +14,7 @@
  */
 
 #include <errno.h>
+#include <poll.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,7 +23,7 @@
 #include <unistd.h>
 
 #include <bpf/bpf.h>
-#include <bpf/xsk.h>
+#include <xdp/xsk.h>
 
 #include "afxdp.h"
 
@@ -351,6 +352,16 @@ void afxdp_destroy(struct afxdp_ctx *ctx)
     pthread_mutex_destroy(&ctx->subs_lock);
 }
 
+/*
+ * Number of consecutive empty RX polls before the dispatch thread gives up
+ * busy-polling and blocks in poll(2).  Each iteration is ~50–100 ns, so 64
+ * spins ≈ 3–6 µs of busy-wait before sleeping.  On the first packet after
+ * an idle period the worst-case wake latency is the poll() timeout (1 ms);
+ * under sustained load the counter never reaches the threshold so latency
+ * stays in the 1–2 µs busy-poll range.
+ */
+#define BUSY_POLL_BUDGET 64
+
 /* ── Dispatch loop ─────────────────────────────────────────────────────────
  *
  * Runs on a dedicated thread, busy-polling the aggregator XSK RX ring.
@@ -363,13 +374,16 @@ void afxdp_destroy(struct afxdp_ctx *ctx)
  *      decrements the refcount; on reaching 0 the frame is recycled to the
  *      fill ring so the NIC can DMA the next packet into it.
  *
- * The busy-poll keeps this thread hot on a single CPU core, achieving
- * ~1–2 µs dispatch latency vs ~5–20 µs with epoll.  Pin this core to the
- * same NUMA node as the NIC (Tier-1 IRQ affinity) for best results.
+ * Hybrid idle strategy: spin for BUSY_POLL_BUDGET empty batches (~3–6 µs),
+ * then block in poll(2) with a 1 ms timeout.  Under load the budget is never
+ * exhausted, preserving ~1–2 µs dispatch latency.  When idle, the thread
+ * sleeps and burns no CPU.
  */
 void *afxdp_dispatch_loop(void *arg)
 {
     struct afxdp_ctx *ctx = arg;
+    int xsk_fd = xsk_socket__fd(ctx->agg_xsk);
+    int idle   = 0;
 
     /* Recycle frames whose refcount reached 0 back to the fill queue */
     uint64_t recycle_queue[UMEM_NUM_FRAMES];
@@ -380,10 +394,17 @@ void *afxdp_dispatch_loop(void *arg)
         uint32_t rcvd   = xsk_ring_cons__peek(&ctx->agg_rx, 32, &rx_idx);
 
         if (!rcvd) {
-            /* Busy-poll: yield CPU only if nothing arrived for a full batch */
-            sched_yield();
+            if (++idle < BUSY_POLL_BUDGET)
+                continue;  /* still in busy-poll window */
+
+            /* Budget exhausted — sleep until a packet (or 1 ms) wakes us */
+            struct pollfd pfd = { .fd = xsk_fd, .events = POLLIN };
+            poll(&pfd, 1, 1);
+            idle = 0;
             continue;
         }
+
+        idle = 0;
 
         pthread_mutex_lock(&ctx->subs_lock);
         int nsubs = ctx->nsubs;
