@@ -3,16 +3,17 @@
 #
 # Topology:
 #
-#   [ns-router]──veth-router/veth-uplink──[host: igmp-proxy + xdp_upstream]
-#                                               │
-#                            ┌──────────────────┤
-#                            │                  │
-#                veth-ns1h/veth-ns1      veth-ns2h/veth-ns2
-#                [ns1: subscriber]       [ns2: subscriber]
+#   [ns-router]──veth-router/veth-link──[bridge br-uplink]──enp0s8──[real net]
+#                                              │
+#                          ┌───────────────────┤
+#                          │                   │
+#              veth-ns1h/veth-ns1      veth-ns2h/veth-ns2
+#              [ns1: subscriber]       [ns2: subscriber]
 #
 # IPs:
 #   ns-router / veth-router : 10.0.0.1/24  (simulated upstream router)
-#   host      / veth-uplink : 10.0.0.2/24  (proxy uplink, IGMP faces router)
+#   host      / br-uplink   : 10.0.0.2/24  (proxy uplink, XDP+IGMP on bridge)
+#   enp0s8 is a bridge port — IGMP reports reach the real 192.168.1.0/24 net
 #   ns1       / veth-ns1    : 10.0.1.2/24
 #   ns2       / veth-ns2    : 10.0.2.2/24
 #
@@ -49,8 +50,12 @@ cleanup() {
     ip netns del ns-router  2>/dev/null || true
     ip netns del ns1        2>/dev/null || true
     ip netns del ns2        2>/dev/null || true
+    # Remove enp0s8 from bridge before deleting the bridge
+    ip link set enp0s8 nomaster 2>/dev/null || true
+    # Detach XDP from enp0s8 if the daemon left it attached
+    bpftool net detach xdp dev enp0s8 2>/dev/null || true
+    ip link del br-uplink   2>/dev/null || true  # also removes veth-link bridge port
     # Peer veths inside deleted netns are removed automatically
-    ip link del veth-uplink 2>/dev/null || true
     ip link del veth-ns1h   2>/dev/null || true
     ip link del veth-ns2h   2>/dev/null || true
 }
@@ -66,7 +71,10 @@ kill -9   "$(pgrep -x multicast_user)" 2>/dev/null || true
 ip netns del ns-router  2>/dev/null || true
 ip netns del ns1        2>/dev/null || true
 ip netns del ns2        2>/dev/null || true
-ip link del veth-uplink 2>/dev/null || true
+ip link set enp0s8 nomaster 2>/dev/null || true
+ip link del br-uplink   2>/dev/null || true
+# Detach any stale XDP from enp0s8 left by a previous run
+bpftool net detach xdp dev enp0s8 2>/dev/null || true
 ip link del veth-ns1h   2>/dev/null || true
 ip link del veth-ns2h   2>/dev/null || true
 
@@ -76,24 +84,34 @@ ip netns add ns-router
 ip netns add ns1
 ip netns add ns2
 
-# ── 4. Router ↔ host: veth-router (ns-router) / veth-uplink (host) ───────────
-ip link add veth-uplink type veth peer name veth-router
+# ── 4. Router ↔ host: veth-router (ns-router) / veth-link → bridge br-uplink ──
+# Bridge br-uplink has two ports: veth-link (simulated router) and enp0s8 (real
+# uplink). br_pass_frame_up() delivers multicast to br-uplink's RX path where
+# xdp_upstream intercepts and redirects to subscribers.
+ip link add veth-link type veth peer name veth-router
 ip link set veth-router netns ns-router
-ip link set veth-uplink up
-ip addr add 10.0.0.2/24 dev veth-uplink
+ip link set veth-link   up
+
+ip link add br-uplink type bridge
+# Disable multicast snooping so the bridge always floods multicast to all ports
+# and to the local interface (br-uplink RX), where xdp_upstream can intercept.
+ip link set dev br-uplink type bridge mcast_snooping 0
+ip link set veth-link   master br-uplink
+ip link set enp0s8      master br-uplink
+ip link set br-uplink   up
+ip addr add 10.0.0.2/24 dev br-uplink
 
 ip netns exec ns-router ip link set lo up
 ip netns exec ns-router ip link set veth-router up
 ip netns exec ns-router ip addr add 10.0.0.1/24 dev veth-router
 # Router needs a route to the multicast block to send to 239.x.x.x
 ip netns exec ns-router ip route add 239.0.0.0/8 dev veth-router
-# XDP DRV mode strips CHECKSUM_PARTIAL metadata; force full sw checksum so
-# UDP frames have a valid checksum after redirect to subscriber namespaces.
+# XDP DRV mode strips CHECKSUM_PARTIAL; force full sw checksum on the router side
 ip netns exec ns-router ethtool -K veth-router tx-checksumming off 2>/dev/null || true
 
 # Force IGMPv2 on the uplink so the proxy sends v2 membership reports to the
 # router. xdp_downstream reads igmphdr.group, which is only valid in v1/v2.
-sysctl -qw net.ipv4.conf.veth-uplink.force_igmp_version=2
+sysctl -qw net.ipv4.conf.br-uplink.force_igmp_version=2
 
 # ── 5. Subscriber veth pairs ──────────────────────────────────────────────────
 ip link add veth-ns1h type veth peer name veth-ns1
@@ -117,14 +135,14 @@ ip netns exec ns2 sysctl -qw net.ipv4.conf.veth-ns2.force_igmp_version=2
 ip netns exec ns2 sysctl -qw net.ipv4.conf.all.rp_filter=0
 ip netns exec ns2 sysctl -qw net.ipv4.conf.veth-ns2.rp_filter=0
 
-echo "  veth-uplink : $(ip link show veth-uplink | grep -o 'state [A-Z]*')"
+echo "  br-uplink   : $(ip link show br-uplink    | grep -o 'state [A-Z]*')"
 echo "  veth-ns1h   : $(ip link show veth-ns1h   | grep -o 'state [A-Z]*')"
 echo "  veth-ns2h   : $(ip link show veth-ns2h   | grep -o 'state [A-Z]*')"
 
 # ── 6. Start igmp-proxy daemon ────────────────────────────────────────────────
 echo ""
-echo "=== Starting igmp-proxy daemon (uplink=veth-uplink) ==="
-UPLINK_IFACE=veth-uplink "$DAEMON" >/tmp/daemon.log 2>&1 &
+echo "=== Starting igmp-proxy daemon (uplink=br-uplink, enp0s8 is bridge port) ==="
+UPLINK_IFACE=br-uplink "$DAEMON" >/tmp/daemon.log 2>&1 &
 DAEMON_PID=$!
 sleep 2
 
@@ -252,7 +270,7 @@ for i in range(5):
 PYEOF
 
 # Capture at the router-facing side and inside ns1 for diagnostic visibility
-tcpdump -i veth-uplink -c 10 -nn 'udp and dst 239.1.1.1' \
+tcpdump -i br-uplink -c 10 -nn 'udp and dst 239.1.1.1' \
     >/tmp/tcpdump_uplink.log 2>&1 &
 TCPDUMP_UP=$!
 ip netns exec ns1 tcpdump -i veth-ns1 -c 10 -nn 'udp and dst 239.1.1.1' \
@@ -267,7 +285,7 @@ kill $TCPDUMP_UP $TCPDUMP_NS1 2>/dev/null
 wait $TCPDUMP_UP $TCPDUMP_NS1 2>/dev/null
 
 echo ""
-echo "--- tcpdump veth-uplink (0 expected: XDP intercepts before kernel RX) ---"
+echo "--- tcpdump br-uplink (0 expected: XDP intercepts before kernel RX) ---"
 cat /tmp/tcpdump_uplink.log
 echo "--- tcpdump ns1/veth-ns1 (XDP redirect → ns1) ---"
 cat /tmp/tcpdump_ns1.log
